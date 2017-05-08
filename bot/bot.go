@@ -2,129 +2,84 @@ package bot
 
 import (
 	"fmt"
-	"regexp"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ecs"
+	log "github.com/Sirupsen/logrus"
 	. "github.com/jgautheron/slashecs/config"
 	"github.com/nlopes/slack"
 )
 
-func New() {
-	token := Config.SlackToken
-	api := slack.New(token)
-	rtm := api.NewRTM()
-	go rtm.ManageConnection()
+var (
+	logger  = log.WithField("prefix", "bot")
+	signals = make(chan os.Signal, 1)
+)
 
+type Bot struct {
+	rtm *slack.RTM
+}
+
+func New() *Bot {
+	api := slack.New(Config.SlackToken)
+	return &Bot{
+		rtm: api.NewRTM(),
+	}
+}
+
+func (b *Bot) Init() {
+	go b.rtm.ManageConnection()
+	go b.monitorSlackEvents()
+
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
+	select {
+	case <-signals:
+		logger.Warn("Termination signal caught, terminating slashecs...")
+		close(signals)
+	}
+}
+
+func (b *Bot) monitorSlackEvents() {
 Loop:
 	for {
 		select {
-		case msg := <-rtm.IncomingEvents:
-			// fmt.Print("Event Received: ")
+		case msg := <-b.rtm.IncomingEvents:
 			switch ev := msg.Data.(type) {
 			case *slack.ConnectedEvent:
-				fmt.Println("Connection counter:", ev.ConnectionCount)
+				logger.Debug("Connection counter:", ev.ConnectionCount)
 
 			case *slack.MessageEvent:
-				fmt.Printf("Message: %v\n", ev)
-				info := rtm.GetInfo()
+				info := b.rtm.GetInfo()
 				prefix := fmt.Sprintf("<@%s> ", info.User.ID)
-
 				if ev.User != info.User.ID && strings.HasPrefix(ev.Text, prefix) {
-					respond(rtm, ev, prefix)
+					go b.processMessage(ev, prefix)
 				}
 
 			case *slack.RTMError:
-				fmt.Printf("Error: %s\n", ev.Error())
+				logger.Errorf("Error while connecting to Slack: %s\n", ev.Error())
 
 			case *slack.InvalidAuthEvent:
-				fmt.Printf("Invalid credentials")
+				logger.Error("Invalid credentials")
 				break Loop
-
-			default:
-				//Take no action
 			}
 		}
 	}
 }
 
-func respond(rtm *slack.RTM, msg *slack.MessageEvent, prefix string) {
-	// var response string
+func (b *Bot) processMessage(msg *slack.MessageEvent, prefix string) {
 	text := msg.Text
 	text = strings.TrimPrefix(text, prefix)
 	text = strings.TrimSpace(text)
 	text = strings.ToLower(text)
 
-	r := regexp.MustCompile(`^deploy ([\w\d\-\_]+) ([\w\d\-\_]+)$`)
-
-	// @deploybot deploy networking-client 235
-
-	matches := r.FindStringSubmatch(text)
-	if len(matches) > 0 {
-		fmt.Println("deploy")
-		deploy(matches[1], matches[2])
+	for r, cmd := range AvailableCommands {
+		matches := r.FindStringSubmatch(text)
+		if len(matches) > 0 {
+			logger.WithField("regex", r).Debug("The command matched")
+			go cmd(b.rtm, msg, matches)
+			// For now no chaining possibilities
+			break
+		}
 	}
-
-	// if acceptedGreetings[text] {
-	// 	response = "What's up buddy!?!?!"
-	// 	rtm.SendMessage(rtm.NewOutgoingMessage(response, msg.Channel))
-	// } else if acceptedHowAreYou[text] {
-	// 	response = "Good. How are you?"
-	// 	rtm.SendMessage(rtm.NewOutgoingMessage(response, msg.Channel))
-	// }
-}
-
-func deploy(service, tag string) {
-	sess := session.New(&aws.Config{
-		Region: aws.String(Config.AwsRegion),
-		Credentials: credentials.NewStaticCredentials(
-			Config.AwsAccessKeyID,
-			Config.AwsSecretAccessKey,
-			"",
-		),
-	})
-	svc := ecs.New(sess)
-
-	params := &ecs.DescribeTaskDefinitionInput{
-		TaskDefinition: aws.String(service),
-	}
-	resp, err := svc.DescribeTaskDefinition(params)
-
-	if err != nil {
-		// Print the error, cast err to awserr.Error to get the Code and
-		// Message from an error.
-		fmt.Println(err.Error())
-		return
-	}
-
-	// Pretty-print the response data.
-	fmt.Println(resp)
-
-	// newTask := getTaskDefinition(resp, tag)
-	// _, err = svc.RegisterTaskDefinition(&newTask)
-	// if err != nil {
-	// 	fmt.Println(err.Error())
-	// 	panic(err)
-	// }
-
-}
-
-func getTaskDefinition(task *ecs.DescribeTaskDefinitionOutput, tag string) ecs.RegisterTaskDefinitionInput {
-	container := task.TaskDefinition.ContainerDefinitions[0]
-	newContainer := container.SetImage(getUpdatedImage(*container.Image, tag))
-	return ecs.RegisterTaskDefinitionInput{
-		ContainerDefinitions: []*ecs.ContainerDefinition{newContainer},
-		Family:               task.TaskDefinition.Family,
-		NetworkMode:          task.TaskDefinition.NetworkMode,
-		PlacementConstraints: task.TaskDefinition.PlacementConstraints,
-		Volumes:              task.TaskDefinition.Volumes,
-	}
-}
-
-func getUpdatedImage(image, tag string) string {
-	sp := strings.Split(":", image)
-	return strings.Join([]string{sp[0], tag}, ":")
 }

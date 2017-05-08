@@ -11,7 +11,7 @@ func StartCommand() cli.Command {
 		Name:  "start",
 		Usage: "Start the slack bot",
 		Action: func(c *cli.Context) error {
-			bot.New()
+			bot.New().Init()
 			return nil
 		},
 	}
